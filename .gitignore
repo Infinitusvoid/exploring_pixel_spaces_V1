@@ -1,0 +1,8 @@
+.vs/
+
+# Ignore all x64 folders except inside External_libs
+**/x64/
+
+# Un-ignore x64 if it's inside External_libs
+!External_libs/
+!External_libs/**
