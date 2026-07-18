@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <iomanip>
@@ -23,6 +24,7 @@
 // -----------------------------------------------------------------------------
 // Experiment configuration
 // -----------------------------------------------------------------------------
+constexpr const char* PROGRAM_BUILD_TAG = "DIRECT_NORMALIZED_V5_2026_07_19";
 constexpr int SHAPE_GRID_WIDTH = 320;
 constexpr int SHAPE_GRID_HEIGHT = 180;
 constexpr int VIDEO_WIDTH = 1920;
@@ -36,7 +38,7 @@ constexpr bool SHOW_PREVIEW_WINDOW = true;
 constexpr bool RUN_STARTUP_SELF_TESTS = true;
 constexpr bool ENABLE_DEBUG_TOPOLOGY_VALIDATION = true;
 constexpr int GLOBAL_TOPOLOGY_VALIDATION_INTERVAL = 500;
-constexpr int MAX_ACCEPTED_MOVES_PER_GOAL = 100000;
+constexpr int DEFAULT_MAX_ACCEPTED_MOVES_PER_GOAL = 160000;
 constexpr int MAX_CONSECUTIVE_REJECTED_MOVES = 20000;
 constexpr int CANDIDATES_TESTED_PER_ITERATION = 256;
 constexpr double AREA_ERROR_WEIGHT = 1.0;
@@ -55,36 +57,70 @@ constexpr int INITIAL_HOLD_FRAMES = 60;
 constexpr int GOAL_REACHED_HOLD_FRAMES = 30;
 constexpr int FINAL_HOLD_FRAMES = 120;
 constexpr const char* OUTPUT_DIRECTORY = "output";
-constexpr const char* OUTPUT_VIDEO_PATH = "output/shape_coastline_optimization.mp4";
+constexpr const char* OUTPUT_VIDEO_PATH = "output/shape_coastline_v5.mp4";
 constexpr int FFMPEG_CONSTANT_RATE_FACTOR = 18;
 constexpr const char* FFMPEG_PRESET = "medium";
-constexpr bool USE_GPU_CANDIDATE_SCORING = true;
 
-enum class PhaseKind
+// Keep the reference CPU path enabled by default. The compute path performs a
+// GPU -> CPU synchronization after every tiny candidate batch and is not a
+// useful default for this serial optimizer.
+constexpr bool USE_GPU_CANDIDATE_SCORING = false;
+
+// -----------------------------------------------------------------------------
+// Artistic controls
+// -----------------------------------------------------------------------------
+// surface_coverage:
+//   0.0 = the smallest non-empty shape
+//   1.0 = every cell inside FORBIDDEN_BORDER_MARGIN
+//
+// coast_complexity:
+//   0.0 = the compact witness constructed for the requested area
+//   1.0 = the most rugged connected, hole-free witness found by the configured
+//         search budget for that same exact area
+//
+// coast_search_steps does NOT specify pixels or coastline length. It only says
+// how long the witness generator may search for a rugged shape. Every final
+// target is copied from a real validated witness, so the visible optimizer is
+// never given an invented or impossible area/perimeter pair.
+struct ArtisticGoalConfig
 {
-    CompactGrowth,
-    CoastlineGrowth,
-    Smoothing,
-    Migration,
-    Contraction
-};
-struct PhaseConfig
-{
-    PhaseKind kind;
     const char* name;
-    int moves;
-    int goals;
-    double dx;
-    double dy;
+    double surface_coverage;
+    double coast_complexity;
+    int coast_search_steps;
+    int visible_optimizer_move_budget;
+    int hold_frames;
 };
-// Reorder, remove, or tune witness phases here.
-constexpr std::array<PhaseConfig, 5> WITNESS_PHASE_SEQUENCE = { {
-    {PhaseKind::CompactGrowth, "Compact growth", 420, 2, 0.0, 0.0},
-    {PhaseKind::CoastlineGrowth, "Coastline growth", 260, 2, 0.0, 0.0},
-    {PhaseKind::Smoothing, "Smoothing", 180, 1, 0.0, 0.0},
-    {PhaseKind::Migration, "Asymmetric migration", 220, 1, 0.85, 0.35},
-    {PhaseKind::Contraction, "Contraction", 520, 2, 0.0, 0.0},
+
+constexpr ArtisticGoalConfig shape_goal(
+    const char* name,
+    double surface_coverage,
+    double coast_complexity,
+    int coast_search_steps,
+    int visible_optimizer_move_budget = DEFAULT_MAX_ACCEPTED_MOVES_PER_GOAL,
+    int hold_frames = GOAL_REACHED_HOLD_FRAMES)
+{
+    return { name, surface_coverage, coast_complexity, coast_search_steps,
+            visible_optimizer_move_budget, hold_frames };
+}
+
+// This is the ordinary control surface. Edit these values first.
+constexpr std::array<ArtisticGoalConfig, 6> ARTISTIC_GOAL_SEQUENCE = { {
+    shape_goal("Compact expansion",    0.08, 0.05,  300),
+    shape_goal("Large calm body",      0.14, 0.10,  500),
+    shape_goal("Coastline eruption",   0.14, 0.85, 1200, 180000, 45),
+    shape_goal("Partial smoothing",    0.14, 0.35, 1200, 160000),
+    shape_goal("Small rugged remnant", 0.07, 0.72,  900, 160000, 45),
+    shape_goal("Final compact form",   0.04, 0.05,  400, 140000, 60),
 } };
+
+// Witness-search quality/performance controls. These are deliberately modest:
+// the original version worked because witness creation was small and bounded.
+constexpr int WITNESS_CANDIDATES_PER_STEP = 24;
+constexpr int WITNESS_PREVIEW_INTERVAL_STEPS = 20;
+constexpr int WITNESS_GLOBAL_VALIDATION_INTERVAL = 200;
+constexpr double WITNESS_MAX_SECONDS_PER_AREA = 8.0;
+constexpr double WITNESS_EXPLORATION_TEMPERATURE = 2.0;
 constexpr int DX4[4] = { 1, -1, 0, 0 }, DY4[4] = { 0, 0, 1, -1 };
 constexpr int DX8[8] = { 1, -1, 0, 0, 1, 1, -1, -1 }, DY8[8] = { 0, 0, 1, -1, 1, -1, 1, -1 };
 
@@ -153,7 +189,16 @@ struct BinaryShapeState
 };
 struct ShapeGoal
 {
-    int target_area = 0, target_perimeter = 0, area_tolerance = 0, perimeter_tolerance = 0;
+    int target_area = 0;
+    int target_perimeter = 0;
+    int area_tolerance = 0;
+    int perimeter_tolerance = 0;
+    int calibrated_min_perimeter = 0;
+    int calibrated_max_perimeter = 0;
+    int visible_optimizer_move_budget = DEFAULT_MAX_ACCEPTED_MOVES_PER_GOAL;
+    int hold_frames = GOAL_REACHED_HOLD_FRAMES;
+    double requested_surface_coverage = 0.0;
+    double requested_coast_complexity = 0.0;
     std::string descriptive_name;
     std::vector<uint8_t> witness_mask;
 };
@@ -560,130 +605,268 @@ bool apply_move(BinaryShapeState& s, const CandidateMove& m, int64_t number, boo
     return true;
 }
 
-std::pair<double, double> center_of_mass(const BinaryShapeState& s)
+int usable_shape_area(const BinaryShapeState& s)
 {
-    double sx = 0, sy = 0;
-    for (int y = 0; y < s.height; ++y)
-        for (int x = 0; x < s.width; ++x)
-            if (s.occupied(x, y))
-            {
-                sx += x;
-                sy += y;
-            }
-    return { sx / std::max(1, s.occupied_area), sy / std::max(1, s.occupied_area) };
+    int usable_width = s.width - 2 * s.forbidden_border_margin;
+    int usable_height = s.height - 2 * s.forbidden_border_margin;
+    return std::max(1, usable_width * usable_height);
 }
-template <class Rng, class Score>
-bool apply_witness_move(BinaryShapeState& s, PhaseKind phase, Rng& rng, Score score, int64_t number)
+
+int area_from_surface_coverage(const BinaryShapeState& s, double coverage)
 {
-    CandidateMove best;
-    double best_score = std::numeric_limits<double>::infinity();
-    ShapeGoal dummy;
-    dummy.target_area = s.occupied_area;
-    dummy.target_perimeter = s.coastline_length;
-    dummy.witness_mask = s.occupancy;
-    for (int n = 0; n < 320; ++n)
+    double clamped = std::clamp(coverage, 0.0, 1.0);
+    return std::clamp(int(std::llround(clamped * usable_shape_area(s))), 1, usable_shape_area(s));
+}
+
+// Construct an exact-area, compact, connected and hole-free polyomino directly.
+// This avoids spending thousands of hidden optimization moves merely to obtain
+// the low-coast end of the normalized range.
+bool build_compact_shape_for_area(BinaryShapeState& s, int requested_area)
+{
+    int usable_width = s.width - 2 * s.forbidden_border_margin;
+    int usable_height = s.height - 2 * s.forbidden_border_margin;
+    int target_area = std::clamp(requested_area, 1, usable_width * usable_height);
+
+    int best_width = 1;
+    int best_full_rows = target_area;
+    int best_remainder = 0;
+    int best_perimeter = std::numeric_limits<int>::max();
+    double best_aspect_error = std::numeric_limits<double>::infinity();
+    double desired_aspect = double(usable_width) / std::max(1, usable_height);
+
+    for (int width = 1; width <= std::min(usable_width, target_area); ++width)
     {
-        CandidateMove m;
-        if (phase == PhaseKind::CompactGrowth)
+        int full_rows = target_area / width;
+        int remainder = target_area % width;
+        int total_rows = full_rows + (remainder > 0 ? 1 : 0);
+        if (total_rows > usable_height)
+            continue;
+
+        int perimeter = 2 * (width + full_rows) + (remainder > 0 ? 2 : 0);
+        double actual_aspect = double(width) / std::max(1, total_rows);
+        double aspect_error = std::abs(std::log(std::max(1e-9, actual_aspect / desired_aspect)));
+        if (perimeter < best_perimeter ||
+            (perimeter == best_perimeter && aspect_error < best_aspect_error))
         {
-            int i = random_entry(s.addition_candidates, rng);
-            if (i >= 0)
-                m = evaluate_single(s, dummy, i, true, 0, 0);
-        }
-        else if (phase == PhaseKind::Contraction)
-        {
-            int i = random_entry(s.removal_candidates, rng);
-            if (i >= 0)
-                m = evaluate_single(s, dummy, i, false, 0, 0);
-        }
-        else
-        {
-            int r = random_entry(s.removal_candidates, rng), a = random_entry(s.addition_candidates, rng);
-            if (r >= 0 && a >= 0)
-                m = evaluate_swap(s, dummy, r, a, 0, 0);
-        }
-        if (m.type != CandidateMove::Type::None)
-        {
-            double value = score(m);
-            if (value < best_score)
-            {
-                best_score = value;
-                best = m;
-            }
+            best_width = width;
+            best_full_rows = full_rows;
+            best_remainder = remainder;
+            best_perimeter = perimeter;
+            best_aspect_error = aspect_error;
         }
     }
-    return best.type != CandidateMove::Type::None && apply_move(s, best, number, true);
-}
-std::vector<ShapeGoal> generate_witness_goals(const BinaryShapeState& initial)
-{
-    std::cout << "Generating deterministic witness goals...\n";
-    BinaryShapeState s = initial;
-    std::mt19937 rng(RANDOM_SEED ^ 0x9e3779b9U);
-    std::vector<ShapeGoal> goals;
-    int64_t number = 0;
-    for (const auto& phase : WITNESS_PHASE_SEQUENCE)
+
+    std::fill(s.occupancy.begin(), s.occupancy.end(), 0);
+    std::fill(s.last_changed_at_move.begin(), s.last_changed_at_move.end(), -1000000);
+
+    int total_rows = best_full_rows + (best_remainder > 0 ? 1 : 0);
+    int left = s.forbidden_border_margin + (usable_width - best_width) / 2;
+    int bottom = s.forbidden_border_margin + (usable_height - total_rows) / 2;
+
+    for (int y = 0; y < best_full_rows; ++y)
+        for (int x = 0; x < best_width; ++x)
+            s.occupancy[s.index(left + x, bottom + y)] = 1;
+
+    if (best_remainder > 0)
     {
-        int start_perimeter = s.coastline_length;
-        auto start_center = center_of_mass(s);
-        int accepted = 0, next_goal = 1, attempts = 0;
-        while (accepted < phase.moves && attempts++ < phase.moves * 100)
+        int partial_left = left + (best_width - best_remainder) / 2;
+        int partial_y = bottom + best_full_rows;
+        for (int x = 0; x < best_remainder; ++x)
+            s.occupancy[s.index(partial_left + x, partial_y)] = 1;
+    }
+
+    auto measured = measure(s);
+    s.occupied_area = measured.first;
+    s.coastline_length = measured.second;
+    rebuild_frontier(s);
+
+    Validation validation = validate_complete_shape_topology(s);
+    if (!validation.valid || validation.area != target_area)
+    {
+        std::cerr << "Compact witness construction failed: " << validation.message << '\n';
+        return false;
+    }
+    return true;
+}
+
+struct CoastWitnessSnapshot
+{
+    int perimeter = 0;
+    std::vector<uint8_t> mask;
+};
+
+struct CoastCalibration
+{
+    int area = 0;
+    int search_steps = 0;
+    int minimum_perimeter = 0;
+    int maximum_perimeter = 0;
+    std::vector<CoastWitnessSnapshot> increasing_best_witnesses;
+};
+
+CandidateMove evaluate_witness_swap(BinaryShapeState& s, int remove_i, int add_i)
+{
+    CandidateMove result;
+    if (remove_i == add_i || !is_valid_foreground_removal(s, remove_i))
+        return result;
+
+    int remove_delta = perimeter_delta(s, remove_i, false);
+    s.occupancy[remove_i] = 0;
+    bool valid_addition = is_valid_foreground_addition(s, add_i);
+    int add_delta = valid_addition ? perimeter_delta(s, add_i, true) : 0;
+    s.occupancy[remove_i] = 1;
+
+    if (!valid_addition)
+        return result;
+
+    result.type = CandidateMove::Type::Swap;
+    result.first = remove_i;
+    result.second = add_i;
+    result.area_delta = 0;
+    result.perimeter_delta = remove_delta + add_delta;
+    return result;
+}
+
+template <class PreviewCallback>
+CoastCalibration calibrate_coast_range(const BinaryShapeState& compact_shape,
+    int search_steps,
+    uint32_t seed,
+    PreviewCallback&& preview)
+{
+    CoastCalibration calibration;
+    calibration.area = compact_shape.occupied_area;
+    calibration.search_steps = std::max(0, search_steps);
+    calibration.minimum_perimeter = compact_shape.coastline_length;
+    calibration.maximum_perimeter = compact_shape.coastline_length;
+    calibration.increasing_best_witnesses.push_back(
+        { compact_shape.coastline_length, compact_shape.occupancy });
+
+    BinaryShapeState working = compact_shape;
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    int accepted = 0;
+    const auto search_started_at = std::chrono::steady_clock::now();
+
+    for (int step = 1; step <= calibration.search_steps; ++step)
+    {
+        const double elapsed_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - search_started_at).count();
+        if (elapsed_seconds >= WITNESS_MAX_SECONDS_PER_AREA)
         {
-            auto score = [&](const CandidateMove& m) {
-                if (phase.kind == PhaseKind::CompactGrowth)
-                {
-                    double x = m.first % s.width - s.width * .5, y = m.first / s.width - s.height * .5;
-                    return 10.0 * m.perimeter_delta + .0005 * (x * x + y * y);
-                }
-                if (phase.kind == PhaseKind::CoastlineGrowth)
-                    return -20.0 * m.perimeter_delta;
-                if (phase.kind == PhaseKind::Smoothing)
-                    return 20.0 * m.perimeter_delta;
-                if (phase.kind == PhaseKind::Contraction)
-                    return 15.0 * m.perimeter_delta;
-                int rx = m.first % s.width, ry = m.first / s.width, ax = m.second % s.width, ay = m.second / s.width;
-                return -8.0 * (phase.dx * (ax - rx) + phase.dy * (ay - ry)) +
-                    .45 * std::abs(s.coastline_length + m.perimeter_delta - (start_perimeter + 18));
-                };
-            if (!apply_witness_move(s, phase.kind, rng, score, ++number))
+            calibration.search_steps = step - 1;
+            break;
+        }
+        CandidateMove best;
+        int best_resulting_perimeter = std::numeric_limits<int>::min();
+
+        for (int sample = 0; sample < WITNESS_CANDIDATES_PER_STEP; ++sample)
+        {
+            int remove_i = random_entry(working.removal_candidates, rng);
+            int add_i = random_entry(working.addition_candidates, rng);
+            if (remove_i < 0 || add_i < 0)
                 continue;
-            ++accepted;
-            if (accepted >= phase.moves * next_goal / phase.goals)
+
+            CandidateMove candidate = evaluate_witness_swap(working, remove_i, add_i);
+            if (candidate.type == CandidateMove::Type::None)
+                continue;
+
+            int resulting_perimeter = working.coastline_length + candidate.perimeter_delta;
+            if (resulting_perimeter > best_resulting_perimeter)
             {
-                Validation v = validate_complete_shape_topology(s);
-                if (!v.valid)
-                {
-                    std::cerr << "Invalid witness: " << v.message << '\n';
-                    return {};
-                }
-                ShapeGoal g;
-                g.target_area = s.occupied_area;
-                g.target_perimeter = s.coastline_length;
-                g.area_tolerance = AREA_GOAL_TOLERANCE;
-                g.perimeter_tolerance = PERIMETER_GOAL_TOLERANCE;
-                g.descriptive_name = phase.name;
-                if (phase.goals > 1)
-                    g.descriptive_name += " " + std::to_string(next_goal);
-                g.witness_mask = s.occupancy;
-                goals.push_back(std::move(g));
-                std::cout << "  " << goals.back().descriptive_name << ": area " << s.occupied_area << ", perimeter "
-                    << s.coastline_length << '\n';
-                if (++next_goal > phase.goals)
-                    break;
+                best_resulting_perimeter = resulting_perimeter;
+                best = candidate;
             }
         }
-        if (next_goal <= phase.goals)
+
+        if (best.type != CandidateMove::Type::None)
         {
-            std::cerr << "Could not finish witness phase " << phase.name << '\n';
-            return {};
+            bool accept = best.perimeter_delta >= 0;
+            if (!accept)
+            {
+                double probability = std::exp(double(best.perimeter_delta) /
+                    WITNESS_EXPLORATION_TEMPERATURE);
+                accept = unit(rng) < probability;
+            }
+
+            if (accept && apply_move(working, best, step, false))
+            {
+                ++accepted;
+                if (working.coastline_length > calibration.maximum_perimeter)
+                {
+                    calibration.maximum_perimeter = working.coastline_length;
+                    calibration.increasing_best_witnesses.push_back(
+                        { working.coastline_length, working.occupancy });
+                }
+            }
         }
-        if (phase.kind == PhaseKind::Migration)
+
+        if (step % WITNESS_GLOBAL_VALIDATION_INTERVAL == 0 || step == calibration.search_steps)
         {
-            auto end = center_of_mass(s);
-            std::cout << "    center moved (" << start_center.first << ',' << start_center.second << ") -> ("
-                << end.first << ',' << end.second << ")\n";
+            Validation validation = validate_complete_shape_topology(working);
+            if (!validation.valid || !validate_frontier(working))
+            {
+                std::cerr << "Witness calibration failed at step " << step << ": "
+                    << validation.message << '\n';
+                calibration.increasing_best_witnesses.clear();
+                return calibration;
+            }
+        }
+
+        if (step % WITNESS_PREVIEW_INTERVAL_STEPS == 0 || step == calibration.search_steps)
+        {
+            if (!preview(working, step, calibration.search_steps,
+                calibration.maximum_perimeter, accepted))
+            {
+                calibration.increasing_best_witnesses.clear();
+                return calibration;
+            }
         }
     }
-    return goals;
+
+    return calibration;
+}
+
+const CoastWitnessSnapshot& select_witness_for_complexity(const CoastCalibration& calibration,
+    double coast_complexity)
+{
+    double clamped = std::clamp(coast_complexity, 0.0, 1.0);
+    double desired_perimeter = calibration.minimum_perimeter +
+        clamped * double(calibration.maximum_perimeter - calibration.minimum_perimeter);
+
+    const CoastWitnessSnapshot* best = &calibration.increasing_best_witnesses.front();
+    double best_distance = std::abs(double(best->perimeter) - desired_perimeter);
+    for (const CoastWitnessSnapshot& candidate : calibration.increasing_best_witnesses)
+    {
+        double distance = std::abs(double(candidate.perimeter) - desired_perimeter);
+        if (distance < best_distance)
+        {
+            best = &candidate;
+            best_distance = distance;
+        }
+    }
+    return *best;
+}
+
+ShapeGoal make_shape_goal(const ArtisticGoalConfig& config,
+    const CoastCalibration& calibration)
+{
+    const CoastWitnessSnapshot& witness =
+        select_witness_for_complexity(calibration, config.coast_complexity);
+
+    ShapeGoal goal;
+    goal.target_area = calibration.area;
+    goal.target_perimeter = witness.perimeter;
+    goal.area_tolerance = AREA_GOAL_TOLERANCE;
+    goal.perimeter_tolerance = PERIMETER_GOAL_TOLERANCE;
+    goal.calibrated_min_perimeter = calibration.minimum_perimeter;
+    goal.calibrated_max_perimeter = calibration.maximum_perimeter;
+    goal.visible_optimizer_move_budget = config.visible_optimizer_move_budget;
+    goal.hold_frames = config.hold_frames;
+    goal.requested_surface_coverage = std::clamp(config.surface_coverage, 0.0, 1.0);
+    goal.requested_coast_complexity = std::clamp(config.coast_complexity, 0.0, 1.0);
+    goal.descriptive_name = config.name;
+    goal.witness_mask = witness.mask;
+    return goal;
 }
 
 bool run_self_tests()
@@ -741,6 +924,10 @@ bool run_self_tests()
     hole.occupied_area = hm.first;
     hole.coastline_length = hm.second;
     require(!validate_complete_shape_topology(hole).no_holes, "hole detection");
+    BinaryShapeState compact(40, 30, 2);
+    require(build_compact_shape_for_area(compact, 317), "compact exact-area construction");
+    require(compact.occupied_area == 317 && validate_complete_shape_topology(compact).valid,
+        "compact witness validity");
     require(validate_frontier(rectangle), "frontier");
     std::cout << (ok ? "All shape self-tests passed.\n" : "Shape self-tests failed.\n");
     return ok;
@@ -886,7 +1073,7 @@ struct ShapeRenderer
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
         glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
         glfwWindowHint(GLFW_VISIBLE, SHOW_PREVIEW_WINDOW ? GLFW_TRUE : GLFW_FALSE);
-        window = glfwCreateWindow(960, 540, "Shape Coastline Optimization", nullptr, nullptr);
+        window = glfwCreateWindow(960, 540, "Shape Coastline V5 - Direct Normalized Controls", nullptr, nullptr);
         if (!window)
         {
             std::cerr << "Failed to create an OpenGL 4.6 core window.\n";
@@ -903,6 +1090,22 @@ struct ShapeRenderer
         }
         glGetError();
         std::cout << "OpenGL: " << glGetString(GL_VERSION) << " | " << glGetString(GL_RENDERER) << '\n';
+
+        // Present a dark backbuffer immediately. Even if later CPU preparation
+        // takes time, Windows never shows an untouched white client area.
+        if (SHOW_PREVIEW_WINDOW)
+        {
+            int preview_width = 1;
+            int preview_height = 1;
+            glfwGetFramebufferSize(window, &preview_width, &preview_height);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glViewport(0, 0, preview_width, preview_height);
+            glClearColor(0.008f, 0.014f, 0.025f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glfwSwapBuffers(window);
+            glfwPollEvents();
+        }
+
         constexpr const char* vertex = R"GLSL(#version 460 core
 out vec2 uv;void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);uv=p;gl_Position=vec4(p*2.0-1.0,0,1);}
 )GLSL";
@@ -1108,39 +1311,65 @@ struct FfmpegVideoWriter
 
 int main()
 {
-    std::cout << "Binary Shape Coastline Optimization\nGrid: " << SHAPE_GRID_WIDTH << 'x' << SHAPE_GRID_HEIGHT
+    std::cout << "BUILD: " << PROGRAM_BUILD_TAG << "\n"
+        << "Binary Shape Coastline Optimization\nGrid: " << SHAPE_GRID_WIDTH << 'x' << SHAPE_GRID_HEIGHT
         << " | Video: " << VIDEO_WIDTH << 'x' << VIDEO_HEIGHT << " @ " << VIDEO_FRAMES_PER_SECOND
         << " fps\nSeed: " << RANDOM_SEED << " | margin: " << FORBIDDEN_BORDER_MARGIN
-        << " | GPU candidate scoring: " << (USE_GPU_CANDIDATE_SCORING ? "compute shader" : "CPU") << "\n";
+        << " | candidate scoring: " << (USE_GPU_CANDIDATE_SCORING ? "compute shader" : "CPU") << "\n";
+
     if (RUN_STARTUP_SELF_TESTS && !run_self_tests())
         return 1;
+
     ShapeRenderer renderer;
     if (!renderer.initialize())
         return 1;
+
     BinaryShapeState shape(SHAPE_GRID_WIDTH, SHAPE_GRID_HEIGHT, FORBIDDEN_BORDER_MARGIN);
     initialize_rectangle(shape, INITIAL_RECTANGLE_WIDTH, INITIAL_RECTANGLE_HEIGHT);
-    std::vector<uint8_t> initial = shape.occupancy;
     Validation initial_validation = validate_complete_shape_topology(shape);
     if (!initial_validation.valid)
     {
         std::cerr << "Invalid initial shape: " << initial_validation.message << '\n';
         return 1;
     }
-    std::vector<ShapeGoal> goals = generate_witness_goals(shape);
-    if (goals.empty())
+
+    // Prove the render path works before launching FFmpeg or doing any search.
+    // The first visible frame must be the actual rectangle, never a blank window.
+    if (!renderer.render_and_read(shape, 0, 0.0f))
+    {
+        std::cerr << "Initial OpenGL preview failed before FFmpeg startup.\n";
         return 1;
-    assign_mask(shape, initial);
+    }
+    std::cout << "Initial rectangle presented successfully.\n" << std::flush;
+
     FfmpegVideoWriter writer;
     if (!writer.open())
         return 1;
-    int64_t accepted_total = 0, rejected_total = 0;
-    int frames = 0, completed = 0;
-    bool topology_ok = true, ok = true, cancelled = false;
+
+    int64_t accepted_total = 0;
+    int64_t rejected_total = 0;
+    int frames = 0;
+    int completed = 0;
+    bool topology_ok = true;
+    bool ok = true;
+    bool cancelled = false;
+
+    auto render_without_encoding = [&](const BinaryShapeState& preview_shape,
+        int64_t move,
+        float pulse) {
+            if (!renderer.render_and_read(preview_shape, move, pulse))
+            {
+                std::cerr << "OpenGL preview failure.\n";
+                return false;
+            }
+            return true;
+        };
+
     auto capture = [&](float pulse) {
-        Validation v = validate_complete_shape_topology(shape);
-        if (!v.valid)
+        Validation validation = validate_complete_shape_topology(shape);
+        if (!validation.valid)
         {
-            std::cerr << "Capture topology failure: " << v.message << '\n';
+            std::cerr << "Capture topology failure: " << validation.message << '\n';
             topology_ok = false;
             return false;
         }
@@ -1154,23 +1383,150 @@ int main()
         ++frames;
         return true;
         };
-    for (int i = 0; i < INITIAL_HOLD_FRAMES && ok; ++i)
-        ok = capture(0);
-    std::mt19937 rng(RANDOM_SEED);
-    std::uniform_real_distribution<double> unit(0, 1);
+
+    // The first visible and encoded frame is produced immediately.
+    for (int frame = 0; frame < INITIAL_HOLD_FRAMES && ok; ++frame)
+        ok = capture(0.0f);
+    if (!ok)
+    {
+        writer.close();
+        return 1;
+    }
+
+    // Calibrations are cached by exact target area. All goals with the same
+    // surface coverage therefore share one normalized coast range.
+    std::vector<CoastCalibration> calibration_cache;
+
+    std::mt19937 optimizer_rng(RANDOM_SEED);
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
     std::vector<CandidateMove> candidates;
     candidates.reserve(CANDIDATES_TESTED_PER_ITERATION * 2);
-    for (size_t goal_index = 0; goal_index < goals.size() && ok; ++goal_index)
+
+    for (size_t goal_index = 0; goal_index < ARTISTIC_GOAL_SEQUENCE.size() && ok; ++goal_index)
     {
-        const ShapeGoal& goal = goals[goal_index];
-        double starting = goal_energy(shape.occupied_area, shape.coastline_length, goal), current = starting,
-            best = starting, next_capture = CAPTURE_PROGRESS_STEP;
-        int accepted = 0, rejected = 0, consecutive_rejected = 0, since_capture = 0, since_best = 0,
-            mismatch = witness_mismatch(shape, goal);
-        std::cout << "\nGoal " << goal_index + 1 << '/' << goals.size() << ": " << goal.descriptive_name
-            << " | current (" << shape.occupied_area << ',' << shape.coastline_length << ") target ("
-            << goal.target_area << ',' << goal.target_perimeter << ")\n";
-        while (!goal_reached(shape, goal) && accepted < MAX_ACCEPTED_MOVES_PER_GOAL &&
+        const ArtisticGoalConfig& config = ARTISTIC_GOAL_SEQUENCE[goal_index];
+        int target_area = area_from_surface_coverage(shape, config.surface_coverage);
+
+        int required_search_steps = config.coast_search_steps;
+        for (const ArtisticGoalConfig& other : ARTISTIC_GOAL_SEQUENCE)
+            if (area_from_surface_coverage(shape, other.surface_coverage) == target_area)
+                required_search_steps = std::max(required_search_steps, other.coast_search_steps);
+
+        CoastCalibration* calibration = nullptr;
+        for (CoastCalibration& cached : calibration_cache)
+            if (cached.area == target_area && cached.search_steps >= required_search_steps)
+            {
+                calibration = &cached;
+                break;
+            }
+
+        if (!calibration)
+        {
+            BinaryShapeState compact(SHAPE_GRID_WIDTH, SHAPE_GRID_HEIGHT, FORBIDDEN_BORDER_MARGIN);
+            if (!build_compact_shape_for_area(compact, target_area))
+            {
+                ok = false;
+                break;
+            }
+
+            std::cout << "\nLIVE witness search for area " << target_area
+                << " (surface " << std::fixed << std::setprecision(3)
+                << double(target_area) / usable_shape_area(shape)
+                << ", requested steps " << required_search_steps
+                << ", time cap " << WITNESS_MAX_SECONDS_PER_AREA << "s)...\n"
+                << std::flush;
+
+            int last_reported_tenth = -1;
+            CoastCalibration generated = calibrate_coast_range(
+                compact,
+                required_search_steps,
+                RANDOM_SEED ^ uint32_t(target_area * 2654435761u),
+                [&](const BinaryShapeState& preview_shape,
+                    int step,
+                    int total_steps,
+                    int maximum_perimeter,
+                    int accepted_swaps) {
+                        if (renderer.cancelled())
+                        {
+                            cancelled = true;
+                            return false;
+                        }
+                        int tenth = total_steps > 0 ? (10 * step) / total_steps : 10;
+                        if (tenth != last_reported_tenth)
+                        {
+                            std::cout << "  witness search " << tenth * 10 << "% | current coast "
+                                << preview_shape.coastline_length << " | best coast "
+                                << maximum_perimeter << " | accepted swaps "
+                                << accepted_swaps << '\n' << std::flush;
+                            last_reported_tenth = tenth;
+                        }
+                        return render_without_encoding(preview_shape, step, 0.03f);
+                });
+
+            if (cancelled)
+                break;
+            if (generated.increasing_best_witnesses.empty())
+            {
+                std::cerr << "Could not produce a valid coastline calibration.\n";
+                ok = false;
+                break;
+            }
+
+            std::cout << "  calibrated valid coast range ["
+                << generated.minimum_perimeter << ", "
+                << generated.maximum_perimeter << "]\n";
+            calibration_cache.push_back(std::move(generated));
+            calibration = &calibration_cache.back();
+
+            // Return the preview to the actual visible optimization state.
+            if (!render_without_encoding(shape, accepted_total, 0.0f))
+            {
+                ok = false;
+                break;
+            }
+        }
+
+        ShapeGoal goal = make_shape_goal(config, *calibration);
+        Validation witness_validation;
+        BinaryShapeState witness_check(SHAPE_GRID_WIDTH, SHAPE_GRID_HEIGHT, FORBIDDEN_BORDER_MARGIN);
+        assign_mask(witness_check, goal.witness_mask);
+        witness_validation = validate_complete_shape_topology(witness_check);
+        if (!witness_validation.valid || witness_validation.area != goal.target_area ||
+            witness_validation.perimeter != goal.target_perimeter)
+        {
+            std::cerr << "Selected witness is invalid: " << witness_validation.message << '\n';
+            ok = false;
+            break;
+        }
+
+        double actual_complexity = goal.calibrated_max_perimeter > goal.calibrated_min_perimeter
+            ? double(goal.target_perimeter - goal.calibrated_min_perimeter) /
+            double(goal.calibrated_max_perimeter - goal.calibrated_min_perimeter)
+            : 0.0;
+
+        std::cout << "\nGoal " << goal_index + 1 << '/' << ARTISTIC_GOAL_SEQUENCE.size()
+            << ": " << goal.descriptive_name
+            << "\n  requested surface: " << goal.requested_surface_coverage
+            << "\n  requested coast complexity: " << goal.requested_coast_complexity
+            << "\n  actual reachable coast complexity: " << actual_complexity
+            << "\n  valid target area/coast: " << goal.target_area << '/'
+            << goal.target_perimeter
+            << "\n  calibrated coast range: [" << goal.calibrated_min_perimeter
+            << ", " << goal.calibrated_max_perimeter << "]\n";
+
+        double starting_energy = goal_energy(shape.occupied_area, shape.coastline_length, goal);
+        double current_energy = starting_energy;
+        double best_energy = starting_energy;
+        double next_capture_progress = CAPTURE_PROGRESS_STEP;
+        int accepted_for_goal = 0;
+        int rejected_for_goal = 0;
+        int consecutive_rejected = 0;
+        int moves_since_capture = 0;
+        int moves_since_best = 0;
+        int mismatch = witness_mismatch(shape, goal);
+
+        while (!goal_reached(shape, goal) &&
+            accepted_for_goal < goal.visible_optimizer_move_budget &&
             consecutive_rejected < MAX_CONSECUTIVE_REJECTED_MOVES)
         {
             if (renderer.cancelled())
@@ -1178,129 +1534,190 @@ int main()
                 cancelled = true;
                 break;
             }
-            bool guided = since_best >= WITNESS_GUIDANCE_STALL_MOVES;
-            double weight = guided ? WITNESS_GUIDANCE_WEIGHT : 0;
-            int test_count = guided ? CANDIDATES_TESTED_PER_ITERATION * 2 : CANDIDATES_TESTED_PER_ITERATION;
-            sample_moves(shape, goal, rng, mismatch, weight, test_count, candidates);
+
+            bool witness_guided = moves_since_best >= WITNESS_GUIDANCE_STALL_MOVES;
+            double witness_weight = witness_guided ? WITNESS_GUIDANCE_WEIGHT : 0.0;
+            int sample_count = witness_guided
+                ? CANDIDATES_TESTED_PER_ITERATION * 2
+                : CANDIDATES_TESTED_PER_ITERATION;
+
+            sample_moves(shape, goal, optimizer_rng, mismatch,
+                witness_weight, sample_count, candidates);
             if (candidates.empty())
             {
-                ++rejected;
+                ++rejected_for_goal;
                 ++rejected_total;
                 ++consecutive_rejected;
                 continue;
             }
-            if (!renderer.scorer.score(candidates, shape, goal, mismatch, weight))
+
+            if (!renderer.scorer.score(candidates, shape, goal, mismatch, witness_weight))
             {
-                std::cerr << "GPU candidate scoring failed.\n";
+                std::cerr << "Candidate scoring failed.\n";
                 ok = false;
                 break;
             }
-            auto chosen = std::min_element(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
-                return a.augmented_energy < b.augmented_energy;
+
+            auto selected = std::min_element(
+                candidates.begin(), candidates.end(),
+                [](const CandidateMove& a, const CandidateMove& b) {
+                    return a.augmented_energy < b.augmented_energy;
                 });
-            double progress = starting > 0 ? std::clamp(1 - best / starting, 0.0, 1.0) : 1;
-            double temperature =
-                std::max(MINIMUM_ANNEALING_TEMPERATURE,
-                    INITIAL_ANNEALING_TEMPERATURE * std::max(.02, 1 - progress) * std::max(.02, 1 - progress));
-            if (guided)
+
+            double progress = starting_energy > 0.0
+                ? std::clamp(1.0 - best_energy / starting_energy, 0.0, 1.0)
+                : 1.0;
+            double temperature = std::max(
+                MINIMUM_ANNEALING_TEMPERATURE,
+                INITIAL_ANNEALING_TEMPERATURE *
+                std::max(0.02, 1.0 - progress) *
+                std::max(0.02, 1.0 - progress));
+            if (witness_guided)
                 temperature *= STALL_TEMPERATURE_BOOST;
-            double current_augmented = current + weight * double(mismatch) / shape.occupancy.size();
-            bool accept = chosen->augmented_energy <= current_augmented ||
-                unit(rng) < std::exp(-(chosen->augmented_energy - current_augmented) / temperature);
-            if (!accept || !apply_move(shape, *chosen, accepted_total + 1, true))
+
+            double current_augmented = current_energy +
+                witness_weight * double(mismatch) / shape.occupancy.size();
+            bool accept = selected->augmented_energy <= current_augmented ||
+                unit(optimizer_rng) < std::exp(
+                    -(selected->augmented_energy - current_augmented) / temperature);
+
+            if (!accept || !apply_move(shape, *selected, accepted_total + 1, false))
             {
-                ++rejected;
+                ++rejected_for_goal;
                 ++rejected_total;
                 ++consecutive_rejected;
                 continue;
             }
-            ++accepted;
+
+            ++accepted_for_goal;
             ++accepted_total;
-            ++since_capture;
-            ++since_best;
+            ++moves_since_capture;
+            ++moves_since_best;
             consecutive_rejected = 0;
-            current = goal_energy(shape.occupied_area, shape.coastline_length, goal);
-            mismatch += chosen->mismatch_delta;
-            bool new_best = current < best;
+            current_energy = goal_energy(shape.occupied_area, shape.coastline_length, goal);
+            mismatch += selected->mismatch_delta;
+
+            bool new_best = current_energy < best_energy;
             if (new_best)
             {
-                best = current;
-                since_best = 0;
+                best_energy = current_energy;
+                moves_since_best = 0;
             }
-            if (ENABLE_DEBUG_TOPOLOGY_VALIDATION && accepted_total % GLOBAL_TOPOLOGY_VALIDATION_INTERVAL == 0)
+
+            if (ENABLE_DEBUG_TOPOLOGY_VALIDATION &&
+                accepted_total % GLOBAL_TOPOLOGY_VALIDATION_INTERVAL == 0)
             {
-                Validation v = validate_complete_shape_topology(shape);
-                if (!v.valid || !validate_frontier(shape))
+                Validation validation = validate_complete_shape_topology(shape);
+                if (!validation.valid || !validate_frontier(shape))
                 {
-                    std::cerr << "Periodic validation failed: " << v.message << '\n';
+                    std::cerr << "Periodic validation failed: "
+                        << validation.message << '\n';
                     topology_ok = false;
                     ok = false;
                     break;
                 }
             }
-            double updated = starting > 0 ? std::clamp(1 - best / starting, 0.0, 1.0) : 1;
-            bool threshold = updated + 1e-12 >= next_capture;
-            bool best_event = new_best && since_capture >= CAPTURE_MINIMUM_ACCEPTED_MOVE_GAP;
-            bool max_gap = since_capture >= CAPTURE_MAXIMUM_ACCEPTED_MOVE_GAP;
-            if (threshold || best_event || max_gap)
+
+            double updated_progress = starting_energy > 0.0
+                ? std::clamp(1.0 - best_energy / starting_energy, 0.0, 1.0)
+                : 1.0;
+            bool crossed_threshold = updated_progress + 1e-12 >= next_capture_progress;
+            bool meaningful_best = new_best &&
+                moves_since_capture >= CAPTURE_MINIMUM_ACCEPTED_MOVE_GAP;
+            bool maximum_gap = moves_since_capture >= CAPTURE_MAXIMUM_ACCEPTED_MOVE_GAP;
+
+            if (crossed_threshold || meaningful_best || maximum_gap)
             {
-                ok = capture(0);
-                since_capture = 0;
-                while (next_capture <= updated + 1e-12)
-                    next_capture += CAPTURE_PROGRESS_STEP;
+                ok = capture(0.0f);
+                moves_since_capture = 0;
+                while (next_capture_progress <= updated_progress + 1e-12)
+                    next_capture_progress += CAPTURE_PROGRESS_STEP;
             }
-            if (accepted % 1000 == 0)
-                std::cout << "  area " << shape.occupied_area << '/' << goal.target_area << ", perimeter "
-                << shape.coastline_length << '/' << goal.target_perimeter << ", energy " << std::scientific
-                << current << ", best " << best << std::fixed << ", accepted " << accepted << ", rejected "
-                << rejected << ", frames " << frames << ", temperature " << temperature
-                << (guided ? ", witness guidance" : "") << '\n';
+
+            if (accepted_for_goal % 1000 == 0)
+            {
+                std::cout << "  area " << shape.occupied_area << '/' << goal.target_area
+                    << ", coast " << shape.coastline_length << '/'
+                    << goal.target_perimeter << ", accepted "
+                    << accepted_for_goal << ", rejected "
+                    << rejected_for_goal << ", frames " << frames
+                    << (witness_guided ? ", witness guidance" : "") << '\n';
+            }
         }
+
         if (cancelled || !ok)
             break;
+
         if (!goal_reached(shape, goal))
         {
-            std::cerr << "WARNING: goal budget exhausted; advancing.\n";
+            std::cerr << "WARNING: goal search budget exhausted; advancing to the next goal.\n";
             continue;
         }
-        Validation v = validate_complete_shape_topology(shape);
-        if (!v.valid || v.area != goal.target_area || v.perimeter != goal.target_perimeter)
+
+        Validation completed_validation = validate_complete_shape_topology(shape);
+        if (!completed_validation.valid ||
+            completed_validation.area != goal.target_area ||
+            completed_validation.perimeter != goal.target_perimeter)
         {
-            std::cerr << "Goal completion validation failed: " << v.message << '\n';
+            std::cerr << "Goal completion validation failed: "
+                << completed_validation.message << '\n';
             topology_ok = false;
             ok = false;
             break;
         }
+
         ++completed;
-        std::cout << "Reached goal " << goal_index + 1 << ": area " << shape.occupied_area << ", perimeter "
-            << shape.coastline_length << ", accepted " << accepted << ", rejected " << rejected << '\n';
-        for (int f = 0; f < GOAL_REACHED_HOLD_FRAMES && ok; ++f)
-            ok = capture(float(.5 + .5 * std::sin(f * 6.28318530718 / std::max(1, GOAL_REACHED_HOLD_FRAMES))));
+        std::cout << "Reached goal " << goal_index + 1 << ": area "
+            << shape.occupied_area << ", coast "
+            << shape.coastline_length << ", accepted "
+            << accepted_for_goal << ", rejected "
+            << rejected_for_goal << '\n';
+
+        for (int frame = 0; frame < goal.hold_frames && ok; ++frame)
+        {
+            float pulse = float(0.5 + 0.5 * std::sin(
+                frame * 6.28318530718 / std::max(1, goal.hold_frames)));
+            ok = capture(pulse);
+        }
     }
+
     if (ok && !cancelled)
     {
-        Validation v = validate_complete_shape_topology(shape);
-        if (!v.valid)
+        Validation final_validation = validate_complete_shape_topology(shape);
+        if (!final_validation.valid)
         {
             topology_ok = false;
             ok = false;
         }
-        for (int f = 0; f < FINAL_HOLD_FRAMES && ok; ++f)
-            ok = capture(0);
+        for (int frame = 0; frame < FINAL_HOLD_FRAMES && ok; ++frame)
+            ok = capture(0.0f);
     }
+
     bool ffmpeg_ok = writer.close();
     double duration = double(frames) / VIDEO_FRAMES_PER_SECOND;
-    std::cout << "\nGeneration summary\nOutput video: " << std::filesystem::absolute(OUTPUT_VIDEO_PATH).string()
-        << "\nGoals completed: " << completed << '/' << goals.size() << "\nAccepted moves: " << accepted_total
-        << "\nRejected moves: " << rejected_total << "\nRendered frames: " << frames
-        << "\nApproximate duration: " << std::fixed << std::setprecision(2) << duration
-        << " seconds\nFinal area/perimeter: " << shape.occupied_area << '/' << shape.coastline_length
-        << "\nAll topology validations passed: " << (topology_ok ? "yes" : "no")
+    std::cout << "\nGeneration summary\nBuild: " << PROGRAM_BUILD_TAG
+        << "\nOutput video: "
+        << std::filesystem::absolute(OUTPUT_VIDEO_PATH).string()
+        << "\nGoals completed: " << completed << '/'
+        << ARTISTIC_GOAL_SEQUENCE.size()
+        << "\nAccepted moves: " << accepted_total
+        << "\nRejected moves: " << rejected_total
+        << "\nRendered frames: " << frames
+        << "\nApproximate duration: " << std::fixed
+        << std::setprecision(2) << duration << " seconds"
+        << "\nFinal area/perimeter: " << shape.occupied_area << '/'
+        << shape.coastline_length
+        << "\nAll topology validations passed: "
+        << (topology_ok ? "yes" : "no")
         << "\nFFmpeg exit status: " << writer.exit_status << '\n';
+
     if (cancelled)
         std::cout << "Cancelled cleanly; FFmpeg was finalized.\n";
-    bool exists = std::filesystem::exists(OUTPUT_VIDEO_PATH) && std::filesystem::file_size(OUTPUT_VIDEO_PATH) > 0;
-    if (!exists)
+
+    bool output_exists = std::filesystem::exists(OUTPUT_VIDEO_PATH) &&
+        std::filesystem::file_size(OUTPUT_VIDEO_PATH) > 0;
+    if (!output_exists)
         std::cerr << "Output video is missing or empty.\n";
-    return ok && ffmpeg_ok && exists && topology_ok ? 0 : 1;
+
+    return ok && ffmpeg_ok && output_exists && topology_ok ? 0 : 1;
 }
