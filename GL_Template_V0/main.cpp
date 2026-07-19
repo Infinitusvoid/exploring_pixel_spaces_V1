@@ -25,8 +25,8 @@
 // Experiment configuration
 // -----------------------------------------------------------------------------
 constexpr const char* PROGRAM_BUILD_TAG = "DIRECT_NORMALIZED_V5_2026_07_19";
-constexpr int SHAPE_GRID_WIDTH = 320;
-constexpr int SHAPE_GRID_HEIGHT = 180;
+constexpr int SHAPE_GRID_WIDTH = 1920 / 4;// 320;
+constexpr int SHAPE_GRID_HEIGHT = 1080 / 4;// 180;
 constexpr int VIDEO_WIDTH = 1920;
 constexpr int VIDEO_HEIGHT = 1080;
 constexpr int VIDEO_FRAMES_PER_SECOND = 60;
@@ -105,13 +105,17 @@ constexpr ArtisticGoalConfig shape_goal(
 }
 
 // This is the ordinary control surface. Edit these values first.
-constexpr std::array<ArtisticGoalConfig, 6> ARTISTIC_GOAL_SEQUENCE = { {
+constexpr std::array<ArtisticGoalConfig, 6 + 4> ARTISTIC_GOAL_SEQUENCE = { {
     shape_goal("Compact expansion",    0.08, 0.05,  300),
     shape_goal("Large calm body",      0.14, 0.10,  500),
     shape_goal("Coastline eruption",   0.14, 0.85, 1200, 180000, 45),
     shape_goal("Partial smoothing",    0.14, 0.35, 1200, 160000),
     shape_goal("Small rugged remnant", 0.07, 0.72,  900, 160000, 45),
     shape_goal("Final compact form",   0.04, 0.05,  400, 140000, 60),
+    shape_goal("Final compact form W0",   0.9, 0.2,  1200, 140000, 60),
+    shape_goal("Final compact form W0",   0.6, 0.4,  1200, 140000, 60),
+    shape_goal("Final compact form W0",   0.2, 0.9,  1200, 140000, 60),
+    shape_goal("Final compact form W0",   0.4, 0.4,  1200, 140000, 60),
 } };
 
 // Witness-search quality/performance controls. These are deliberately modest:
